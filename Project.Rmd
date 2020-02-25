@@ -1,0 +1,800 @@
+---
+title: "Causal Discovery on Flow Cytometry Data"
+author: "Julian Schmocker"
+date: "18 12 2019"
+header-includes:
+ \usepackage{float}
+output:
+  pdf_document: 
+    number_sections: true
+  html_document: 
+    number_sections: true
+  
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.pos = 'H')
+```
+
+
+# Introduction
+
+In this project, various methods for causal inference were applied on a dataset from the paper _Causal Protein-Signaling Networks Derived from Multiparameter Single-Cell Data_ (1), where they were able to almost reconstruct a known causal signaling pathway using Bayesian networks. 
+
+Initially, the aim of this project was to reproduce the analysis from the paper _Predicting Causal Relationships from Biological Data: Applying Automated Cytometry Data of Human Immune Cells_ (2), where they tried to discover novel causal relationships from a large collection of public mass cytometry data of immune cells perturbed with a variety of compounds. Unfortunately, it was not possible to download the data from (2) because the Cytobank servers, on which the data was stored, were down. This is why the methods for causal inference were tested on the Sachs, et al. data.
+
+![This figure demonstrates how the approach from (1) works. There were 9 different perturbation conditions applied to a set of individual cells. Then the expression levels of different proteins were recorded with a multiparameter flow cytometer. With a Bayesian network analysis they tried to detect the structure of the signaling pathway. Figure from Sachs, et al. (1).](.//F1_large.jpg){#id .class width=60% height=60%}
+
+## Biological Background
+
+Signaling pathways represent a cascade of information flow and they play an important part in cellular communication. The cascade is triggered by a signal, which modifies a signaling molecule's structure (chemically or physically) or changes the location of the molecule. This reaction then has an effect other molecules in the cascade. Such a reaction can be seen as a causal effect from one molecule to other molecules. 
+
+Often, scientists just study individual pathways. In those situations only one protein was perturbed and then the effects of this perturbation were studied. This approach has the disadvantage that interpathway cross-talk and other properties of networks can not be examined. With the network based causal inference methods, which were applied in this project, it is possible to look simultaneously at several pathways.
+
+Figure 2 illustrates which were the conventionally accepted connenctions of the signaling molecules (via arcs) before publication of the paper. It also shows which protein is influenced by the stimulatory cues (green) or the inhibitory interventions (red).
+
+![The nodes in color were measured directly. There are no measurements in the data for the gray nodes. Figure from Sachs, et al. (1).](.//F2_large.jpg){#id .class width=60% height=60%}
+
+Table 1 gives an overview of the reagents that were used. The effect of the reagent is shortened and simplified.  
+
+```{r, echo = FALSE,warning=FALSE, message=FALSE }
+library(kableExtra)
+cues <- c("Anti-CD2/CD28", "ICAM-2", "$\\beta$2camp", "AKT inhibitor", "U0126", "PMA", "G0076", "Psitectorigenin", "LY294002")
+n_fig2 <- c("1,2", "3", "5", "7", "9","4","6","8","10") 
+r_type <- c("General", "General", rep("Specific", 7))
+r_eff <- linebreak(c("Activates T cells and induces \n proliferation and cytokine production", "Induces LFA-1 signaling \n and contributes to CD3/CD28 signaling", "Activates PKA", "Inhibits AKT","Inhibits MEK1/2","Activates PKC and initiates some \n aspects of T cell activation", "Inhibits phosphoinositide hydrolysis \n and PIP2 production", "Inhibits PIP2 production", "PI3K (not measured) inhibitor"))
+df <- data.frame(Reagent = cues, 'No in Fig2' = n_fig2, 'Reagent class' = r_type, 'Effect of Reagent' = r_eff )
+df %>%
+  kable( , format = "latex", escape = FALSE, booktabs = TRUE, caption = "Overview stimulations") %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+```
+
+For each method that will be applied, we will get a predicted causal graph. The result will be compared with the network that was inferred in Sachs et al. (2005). In their resulting network 15 of the 17 predicted arcs are well-established in the literature. Two of the predicted arcs are not well known, but there exist publications that mentioned those connections. They were able to verify those two connections with experiments.
+
+```{r figs, echo = FALSE,warning=FALSE, message=FALSE, fig.height = 5, fig.width = 8,out.width='4.8in',fig.align='center' ,fig.cap="\\label{fig:figs}Validated network from Sachs et al. (2005). Protein p44.42 is also known as Erk1/2."}
+library(bnlearn)
+library(pcalg)
+library(network)
+library(arules)
+require(Rgraphviz)
+
+c_names <- c("praf", "pmek", "plcg", "PIP2","PIP3", "p44.42", "pakts473", "PKA", "PKC", 
+             "P38", "pjnk") 
+true_m <- matrix(0,11,11)
+rownames(true_m) <- colnames(true_m) <- c_names
+
+true_m[1,2] <- true_m[2,6] <- true_m[3,4] <- true_m[3,5] <-  true_m[5,4]  <- true_m[8,7] <- true_m[6,7] <- true_m[8,1] <- true_m[8,10] <- true_m[8,2] <- true_m[8,11] <- true_m[9,8] <-
+true_m[8,6] <- true_m[9,1] <- true_m[9,10] <- true_m[9,2] <- true_m[9,11] <- 1
+
+am.graph<-new("graphAM", adjMat=true_m, edgemode="directed")
+Rgraphviz::plot(am.graph, lwd =1.5, 
+                attrs = list(node = list(fillcolor = "#81abca", 
+                                         fontsize = 20), edge = list(arrowsize=1)))
+
+
+true_rev_m <- t(true_m)
+
+# create a bn object
+true_m_bn = empty.graph(c_names)
+amat(true_m_bn) <- true_m
+```
+
+To get an overview how similar the predicted network are with the validated network, the following summary was calculated.
+
+* Arcs that agree with the validated structure (also correct direction)
+* Arcs that agree with the validated structure, but point in the wrong direction
+* Arcs that don't agree with the validated structure
+
+For each of the classes, we have the maximal number of arcs:
+
+```{r, echo = FALSE,warning=FALSE, message=FALSE }
+library(kableExtra)
+df <- data.frame('Correct Arcs' = sum(true_m), 'Reversed Arcs' = sum(true_rev_m), 'Other Arcs' = sum((true_m+true_rev_m) ==0 ))
+rownames(df) <- "Possible Arcs"
+df %>%
+  kable( ,caption = "Maximal Number of Arcs in each Class") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+
+## Data
+
+### Sachs (2005)
+
+There were 9 different perturbation conditions employed on the signaling network. For each condition the content of 11 phosphorylated protein and phospholipid components were simultaneously measured from thousands of individual primary immune system cells. The levels were measured with a multiparameter flow cytometer. The 11 phosphorylated protein and phospholipid components correspond to the nodes in figure 3.
+
+The perturbations can be grouped in two different classes. First, there are the general stimulatory cues. Here, the protein signaling paths are active but there are no specific activators or inhibitors for one of the measured 11 phosporylated proteins or phospholipids used. Then, there are the perturbations with specific stimulatory / inhibitory cues. In that case, the perturbation affects only one of the protein. This also has an impact on all the descendants of the perturbed protein.
+
+The point of intervention of the stimulation can be seen in figure 2. The data from this stimulation (7; CD3, CD28, LY294002) will be considered as observational data. The reason for this is that the interventional site of action PI3K was not measured. 
+
+\pagebreak
+Here is an overview of the 9 perturbation conditions used in this analysis:
+
+```{r, echo = FALSE,warning=FALSE, message=FALSE }
+library(kableExtra)
+cues <- c("CD3, CD28", "CD3, CD28, ICAM-2", "CD3, CD28, akt-inhibitor", "CD3, CD28, G0076", "CD3, CD28, Psitectorigenin", "CD3, CD28, U0126", "CD3, CD28, LY294002", "PMA", "$\\beta$2camp")
+df <- data.frame( No. = 1:9, Stimulations = cues, 'Intervention site of action' = c("-","-","Akt", "PKC","PIP2","MEK1/MEK2","-","PKC","PKA"))
+df %>%
+  kable( , format = "latex", escape = FALSE, booktabs=TRUE, caption = "Overview stimulations") %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+```
+
+
+
+### Data preparation
+
+The data was downloaded from the [webpage of the article](https://science.sciencemag.org/content/308/5721/523). There was an excel sheet available for each of perturbation conditions that are mentioned in table 2. Initially, a column with the intervention type was added to each dataset (according to table 2) and then all the dataframes were merged into one large dataframe. Thereafter, all the data points that fell more than three standard deviations from the mean were discarded (According to the supplement of the article from Sachs, et al.). 
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+library(readxl)
+library(plyr)
+library(robustHD)
+library(dplyr)
+
+files <- list.files(path = ".//data", pattern = "*.xls", full.names = T)
+tbl <- sapply(files, read_excel, simplify=FALSE) 
+
+for (i in 1:length(tbl)){
+  tbl[[i]]$intervention2 <- i
+}
+
+# combine all datasets
+sachs <- data.frame(rbind.fill.matrix(tbl))
+
+# remove outliers
+no_outlier <- !logical(dim(sachs)[1])
+for (k in 1:11){
+  k_col <- sachs[,k]
+  no_outlier <- no_outlier & (k_col > (mean(k_col) - 3 * sd(k_col)) ) & 
+    ( k_col < (mean(k_col) + 3 * sd(k_col)))
+  }
+sachs <- sachs[no_outlier,]
+```
+
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+# specify the correct intervention type
+sachs$intervention[sachs$intervention2 %in% c(1,2,7)] <- 0
+sachs$intervention[sachs$intervention2 %in% c(3)] <- 7
+sachs$intervention[sachs$intervention2 %in% c(4,8)] <- 9
+sachs$intervention[sachs$intervention2 == 5] <- 4
+sachs$intervention[sachs$intervention2 == 6] <- 2
+sachs$intervention[sachs$intervention2 == 9] <- 8
+
+sachs$intervention2 <- as.factor(sachs$intervention2)
+
+# discretize the data
+dsachs <- bnlearn::discretize(sachs[,1:11], method = 'hartemink', 
+                                        breaks = 3, ibreaks = 10)
+dsachs$intervention <- as.factor(sachs$intervention)
+
+# display number of observation
+df <- data.frame('Intervention Site of Action' = c("-","pmek","PIP2","pakts473","PKA","PKC"), 'Number of Obervations' = summary(as.factor(sachs$intervention)))
+
+df %>%
+  kable( ,caption = "Observation per intervention - after removing outliers") %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+
+```
+
+Additionally, a discretized dataset was created with the _hartmink_-method in which the protein measurements were reduced to 3 levels. This dataset was then used for Bayesian network approach with tabu search. From the article and the supplement, it is not entirely clear how the data was pre-processed. It is only mentioned that their large dataset contains 5400 data points. The dataset that was used in this project contains 6714 data points.
+
+# Results
+
+In this project 4 different methods were used to infer causal pathways. Initially, they were tested on the original Sachs data (after pre-processing). Furthermore, I created a simulated dataset and examined if it is possible to reconstruct the causal structure. 
+
+## Exploratory Data Analysis
+
+The violin plots in figure 4 demonstrate some effects of 5 different perturbations. The first column of plots (dataset 1) shows the distribution of the proteins in an observational setting. In dataset 3 AKT was inhibited. The distributions look similar to the ones of the observational data because none of the selected proteins is a descendant of AKT.
+
+In dataset 4 PKC was activated and it seems this also activates the other 3 proteins that are on this plot. In dataset 6 the reagent U0126 was employed, which inhibits MEK1 and MEK2. This does not really correspond to the plots. I double checked if the numbering of the datasets are correct, but I did not find any mistake. In dataset 9 PKA was activated. 
+
+```{r, echo = FALSE,warnings = FALSE, message = FALSE, fig.align='center'}
+library(gridExtra)
+library(ggplot2)
+library(ggsci)
+
+cols <- pal_jco()(5)
+
+p1 <- ggplot(sachs[sachs$intervention2 %in% c(1,3,4,6,9),], aes(x=intervention2, y=PKC, 
+                                                       col = intervention2)) + 
+  stat_summary(fun.data="mean_sdl",  geom="crossbar", width=0.3,color = "black", 
+               size= 0.2, fun.args = list(mult = 1))+
+  geom_violin(trim=FALSE) +
+  xlab("dataset")+
+  scale_color_manual(values=cols[c(1,2,3,4,5)])+
+  theme(legend.position="none")
+
+p2 <- ggplot(sachs[sachs$intervention2 %in% c(1,3,4,6,9),], aes(x=intervention2, y=praf, col = intervention2)) + 
+  stat_summary(fun.data="mean_sdl", geom="crossbar", width=0.3,color = "black", 
+               size= 0.2,fun.args = list(mult = 1))+
+  geom_violin(trim=FALSE) +
+  xlab("dataset")+
+  scale_color_manual(values=cols[c(1,2,3,4,5)])+
+  theme(legend.position="none")
+
+p3 <- ggplot(sachs[sachs$intervention2 %in% c(1,3,4,6,9),], aes(x=intervention2, y=pmek, col = intervention2)) + 
+  stat_summary(fun.data="mean_sdl",  geom="crossbar", width=0.3,color = "black", 
+               size= 0.2,fun.args = list(mult = 1))+
+  geom_violin(trim=FALSE) +
+  xlab("dataset")+
+  scale_color_manual(values=cols[c(1,2,3,4,5)])+
+  theme(legend.position="none")
+  
+
+p4 <- ggplot(sachs[sachs$intervention2 %in% c(1,3,4,6,9),], aes(x=intervention2, y=p44.42, col = intervention2)) + 
+  stat_summary(fun.data="mean_sdl", geom="crossbar", width=0.3,color = "black", 
+               size= 0.2,fun.args = list(mult = 1))+
+  geom_violin(trim=FALSE) +
+  xlab("dataset")+
+  scale_color_manual(labels = c("none", "Akt", "PKC", "MEK1/2", "PKA"),values=cols[c(1,2,3,4,5)])+
+  theme(legend.position="none")
+
+grid.arrange(p1, p2, p3, p4,ncol=1, nrow = 4)
+```
+```{r, echo = FALSE, warning=FALSE, message=FALSE,fig.cap="Violin plots for 4 selected phosphorylated protein / phospholipid for 6 different datasets. The crossbars indicate the mean and mean +/- standard deviation.",fig.align='center'}
+plot(NULL ,xaxt='n',yaxt='n',bty='n',ylab='',xlab='', xlim=0:1, ylim=0:1)
+legend("center", legend =c("none","Akt", "PKC","MEK1/2", "PKA"), pch=16, pt.cex=2, cex=0.8, bty='n',col = cols, ncol = 5, title = "intervention on")
+
+```
+The biplot indicates that the first two principal components explain around 54% of the total variability. The interventional data for which _pmek_ was the site of action seems to form a cluster. The data of the group _PKC_ also has a different structure than the rest of the data. From this plot alone, it is not possible to distinguish any other clusters.
+```{r, echo = FALSE, warning=FALSE, message=FALSE,fig.cap="Sachs (2005) data - Biplot",fig.align='center'}
+library("factoextra")
+library("FactoMineR")
+library("ggsci")
+col.ind = as.factor(sachs$intervention)
+levels(col.ind) <- c("none", "pmek", "PIP2", "pakts473", "PKA", "PKC")
+sachs.pca <- PCA(sachs[,-c(12,13)], graph = FALSE)
+fviz_pca_biplot(sachs.pca,
+             geom = "point",
+             pointshape = 9,
+             pointsize = 0.4,
+             geom.ind = "point", # show points only (nbut not "text")
+             col.ind = col.ind, # color by groups
+             palette = pal_jco()(6),
+             addEllipses =FALSE, # Concentration ellipses
+             legend.title = "Intervention on", 
+             title = "Biplot - PCA",
+             col.var = "darkgray"
+             )
+
+```
+
+### PC-algorithm
+
+The PC-algorithm mainly uses conditional independence relationships to estimate the causal structure. It is essential for this method that the data is generated in an observational setting. Therefore, only the observational data was included in the analysis.
+```{r,echo = FALSE, warning=FALSE, message=FALSE,fig.height = 5, fig.width = 8,out.width='4.8in',fig.align='center'}
+
+# intervention2 is no longer used
+sachs <- sachs[,-12]
+
+set.seed(123)
+library(bnlearn)
+m <- matrix(numeric(11^2),11)
+sachs2 <- sachs[sachs$intervention == 0,]
+
+for (i in 1:100){
+  res <- pc.stable(sachs2[sample(1:nrow(sachs2), 1000),-12])
+  m <- m + amat(res) 
+}
+
+# only select arcs that are in more than 85% of predicted networks
+mm <- m > 100*0.85
+
+# correct paths
+cp <- sum(mm == true_m & true_m ==1)
+
+# reversed paths
+rp <- sum(mm == true_rev_m & true_rev_m ==1)
+
+# paths not in model and not reversed
+op <- sum(mm == 1 & (true_m+true_rev_m) ==0)
+
+```
+With this method it is possible to predict a small part of the validated network. 
+```{r, echo = FALSE,warning=FALSE, message=FALSE }
+library(kableExtra)
+df <- data.frame(correct = cp, reversed = rp, other = op)
+rownames(df) <- "number of arcs"
+df %>%
+  kable( ,caption = "Classification of the predicted arcs") %>%
+  kable_styling(latex_options = "hold_position")
+```
+\pagebreak
+The algorithm left some of the predicted arcs undirected. In the summary such arcs are classified at the same time as correct and reversed arcs. The network inferred by this method has the following form. The bold arcs are the ones that are also contained in the validated network. 
+
+```{r,echo = FALSE, warning=FALSE,message=FALSE,out.width = "52%",fig.cap="PC-algorithm",fig.align='center'}
+
+e = empty.graph(c_names)
+amat(e,check.cycles = FALSE, check.illegal = FALSE) <- mm
+g1 <- graphviz.plot(e, highlight = list(arcs = arcs(true_m_bn), lwd =3.5, col = "1"), render = FALSE)
+
+graph::nodeRenderInfo(g1) <- list( fontsize=20, height = 400, weight = 400, fixedsize = TRUE)
+Rgraphviz::renderGraph(g1)
+```
+
+### Tabu search with modified BDe score (bnlearn)
+
+This approach is the one that is the most similar to the one they used in Sachs, et al. The results are better but there are still 11 arcs in validated network that this method did not predict. 
+```{r, echo = FALSE,warning=FALSE, message=FALSE}
+
+# mBDs Bayesian network
+set.seed(123)
+nodes = names(dsachs)[1:11]
+start = random.graph(nodes = nodes, method = "melancon", num = 200, burn.in = 10^5, every = 100)
+perturbed = sapply(1:11, function(x) which(dsachs$intervention == x))
+names(perturbed) = nodes
+netlist = lapply(start, function(net) {
+  tabu(dsachs[, 1:11], score = "mbde", exp = perturbed, iss = 10, start = net, tabu = 50) })
+arcs = custom.strength(netlist, nodes = nodes)
+
+mm <- amat(averaged.network(arcs, threshold = 0.85))
+ 
+# correct paths
+cp <- sum(mm == true_m & true_m ==1)
+
+# reversed paths
+rp <- sum(mm == true_rev_m & true_rev_m ==1)
+
+# paths not in model and not reversed
+op <- sum(mm == 1 & (true_m+true_rev_m) ==0)
+```
+```{r, echo = FALSE,warning=FALSE, message=FALSE}
+library(kableExtra)
+df <- data.frame(correct = cp, reversed = rp, other = op)
+rownames(df) <- "number of arcs"
+df %>%
+  kable( ,caption = "Classification of the predicted arcs") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+Here is the network that is predicted by this method.
+```{r,echo = FALSE, warning=FALSE,message=FALSE,out.width = "53%",fig.cap="Tabu search with modified BDe score - Result",fig.align='center'}
+
+e = empty.graph(c_names)
+amat(e) <- mm
+g1 <- graphviz.plot(e, highlight = list(arcs = arcs(true_m_bn), lwd =3.5, col = "1"), render = FALSE)
+
+graph::nodeRenderInfo(g1) <- list( fontsize=20, height = 400, weight = 400, fixedsize = TRUE)
+Rgraphviz::renderGraph(g1)
+```
+
+### Greedy interventional equivalence search (GIES) algorithm
+
+The GIES method is a score based method and tries to find the structure that best fits the data. 
+```{r,echo = FALSE, warning=FALSE, message=FALSE,fig.height = 5, fig.width = 8,out.width='4.8in',fig.align='center'}
+set.seed(123)
+library(pcalg)
+m <- matrix(numeric(11^2),11)
+# gies
+t_ind <- c(rep(1,843+868),rep(4,883), rep(6,283), rep(3,801), rep(2,662), rep(1,828), rep(6,866),rep(5,680))
+for (i in 1:100){
+  s_ind <- sample(1:nrow(sachs), 2000)
+  t_ind_s <- t_ind[s_ind]
+  score <- new("GaussL0penIntScore", sachs[s_ind,-12], list(integer(0),2,4,7,8,9), t_ind_s)
+  gies.fit <- gies(score)
+  m <- m+as(gies.fit$essgraph, "matrix")
+}
+
+mm <- m > 100*0.85
+
+# correct paths
+cp <- sum(mm == true_m & true_m ==1)
+
+# reversed paths
+rp <- sum(mm == true_rev_m & true_rev_m ==1)
+
+# paths not in model and not reversed
+op <- sum(mm == 1 & (true_m+true_rev_m) ==0)
+
+```
+```{r, echo = FALSE,warning=FALSE, message=FALSE}
+library(kableExtra)
+df <- data.frame(correct = cp, reversed = rp, other = op)
+rownames(df) <- "number of arcs"
+df %>%
+  kable( ,caption = "Classification of the predicted arcs") %>%
+  kable_styling(latex_options = "hold_position")
+```
+With this method, we find 4 of the arcs of the validated network. It is interesting that they coincide with the ones from the previous approach. 
+```{r,echo = FALSE, warning=FALSE,message=FALSE,out.width = "52%",fig.align='center',fig.cap="Greedy interventional equivalence search (GIES) algorithm"}
+
+e = empty.graph(c_names)
+amat(e,check.cycles = FALSE, check.illegal = FALSE) <- mm
+g1 <- graphviz.plot(e, highlight = list(arcs = arcs(true_m_bn), lwd =3.5, col = "1"), render = FALSE)
+
+graph::nodeRenderInfo(g1) <- list( fontsize=20, height = 400, weight = 400, fixedsize = TRUE)
+Rgraphviz::renderGraph(g1)
+```
+
+### Backshift algorithm
+
+The last algorithm, that was applied, was the Backshift algorithm. This approach differs significantly from the previous algorithms. 
+
+```{r,echo = FALSE, warning=FALSE, message=FALSE}
+library(backShift)
+set.seed(123)
+m <- matrix(numeric(11^2),11)
+
+bs_model <- backShift(sachs[,-12], as.numeric(as.factor(sachs$intervention)), ev = 2, 
+                      nsim = 100, threshold = 0.75,
+                      verbose = FALSE)
+
+mm <- bs_model$AhatAdjacency>0.25
+
+# correct paths
+cp <- sum(mm == true_m & true_m ==1)
+
+# reversed paths
+rp <- sum(mm == true_rev_m & true_rev_m ==1)
+
+# paths not in model and not reversed
+op <- sum(mm == 1 & (true_m+true_rev_m) ==0)
+```
+```{r, echo = FALSE,warning=FALSE, message=FALSE}
+library(kableExtra)
+df <- data.frame(correct = cp, reversed = rp, other = op)
+rownames(df) <- "number of arcs"
+df %>%
+  kable( ,caption = "Classification of the predicted arcs") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+This is probably also the reason that the network from this method is different compared to the previous results. It is interesting that all the predicted arcs are either correct or reversed. 68% percent of the runs converged. This seems to indicate that we don't deal with shift interventions. 
+
+```{r,echo = FALSE, warning=FALSE,message=FALSE,out.width = "57%",fig.align='center', fig.cap="Backshift algorithm"}
+
+e = empty.graph(c_names)
+amat(e,check.cycles = FALSE, check.illegal = FALSE) <- mm
+g1 <- graphviz.plot(e, highlight = list(arcs = arcs(true_m_bn), lwd =3.5, col = "1"), render = FALSE)
+
+graph::nodeRenderInfo(g1) <- list( fontsize=20, height = 400, weight = 400, fixedsize = TRUE)
+Rgraphviz::renderGraph(g1)
+```
+
+
+## Simulated data
+
+Since the structure of the real data seems to be complicated and noisy, the causal inference analysis was also conducted on a simulated dataset. It was tested whether it is possible to detect the causal structure of simulated data.
+
+### Generating simulated data
+
+The causal structure of the simulated data is the same as the one of the validated network from figure 3. All the causal effects are linear and there were only Gaussian noises used. For each of the 9 perturbation condition 600 data points were created. The observational data was simulated in the following way.
+
+$$X_{PKC}^{0} = \epsilon_9, \quad
+X_{plcg}^{0} = \epsilon_3, \quad
+X_{PIP3}^{0} =X_{plcg}^{0} + \epsilon_5, \quad$$
+$$X_{PIP2}^{0} = X_{PIP3}^{0} + X_{plcg}^{0} + \epsilon_4, \quad
+X_{PKA}^{0} = X_{PKA}^{0} + \epsilon_8, $$
+$$X_{praf}^{0} = X_{PKA}^0+X_{PKC}^0+\epsilon_1,\quad
+X_{pmek}^{0} = X_{PKA}^{0} + X_{PKC}^{0} + X_{praf}^{0}+ \epsilon_2, $$
+$$X_{p44.42}^{0} = X_{pmek}^{0} + X_{PKA}^{0}+ \epsilon_6, \quad
+X_{pakts473}^{0} = X_{p44.42}^{0} + X_{PKA}^{0} + \epsilon_7,$$
+$$X_{P38}^{0} = X_{PKA}^{0} + X_{PKC}^{0} + \epsilon_{10}, \quad
+X_{pjnk}^{0} = X_{PKA}^{0} + X_{PKC}^{0} + \epsilon_{11},$$
+
+where $\epsilon_i \stackrel{iid}{\sim} \mathcal{N}(2,1)$ with $1 \leq i \leq 11$.
+
+I tried to simulate the interventional data in a similar way as in the real experiment. For example in dataset 6 a reagent was applied that inhibited MEK1/2. Here, I used the approach
+
+$$X_{pmek}^6 = \mathcal{N}(0,0.1),$$
+$$X_{p44.42}^{6} = X_{pmek}^{6} + X_{PKA}^{0}+ \epsilon_6, \quad
+X_{pakts473}^{6} = X_{p44.42}^{6} + X_{PKA}^{0} + \epsilon_7,$$
+where $\epsilon_i \stackrel{iid}{\sim} \mathcal{N}(2,1)$.
+
+All the descendants of $X_{pmek}$ are influenced by this intervention. The rest of the proteins have the same distribution as in the observational data. 
+
+In dataset 9 PKA was activated. This was modeled by
+
+$$X_{PKA}^9 = \mathcal{N}(6,1),$$
+$$X_{praf}^{9} = X_{PKA}^9+X_{PKC}^0+\epsilon_1,\quad
+X_{pmek}^{9} = X_{PKA}^{9} + X_{PKC}^{0} + X_{praf}^{9} +\epsilon_2, $$
+$$X_{p44.42}^{9} = X_{pmek}^{9} + X_{PKA}^{9}+ \epsilon_6, \quad
+X_{pakts473}^{9} = X_{p44.42}^{9} + X_{PKA}^{9} + \epsilon_7,$$
+$$X_{P38}^{9} = X_{PKA}^{9} + X_{PKC}^{0} + \epsilon_{10}, \quad
+X_{pjnk}^{9} = X_{PKA}^{9} + X_{PKC}^{0} + \epsilon_{11},$$
+where $\epsilon_i \stackrel{iid}{\sim} \mathcal{N}(2,1)$.
+
+The other interventions were simulated accordingly.
+
+```{r, echo = FALSE,warning=FALSE, message=FALSE}
+set.seed(123)
+m <- 9*600
+X <- matrix( numeric(m*11), ncol = 11)
+X[,9] <- rnorm(m, mean = 2, sd = 1)
+X[,3] <- rnorm(m, mean = 2, sd = 1)
+X[,5] <- X[,3] + rnorm(m, mean = 2, sd = 1)
+X[,4] <- X[,5] + X[,3] + rnorm(m, mean = 2, sd = 1)
+X[,8] <- X[,9]+ rnorm(m, mean = 2, sd = 1)
+X[,1] <- X[,8] + X[,9] + rnorm(m, mean = 2, sd = 1)
+X[,2] <- X[,1] + X[,8] + X[,9] + rnorm(m, mean = 2, sd = 1)
+X[,6] <- X[,2] + X[,8] + rnorm(m, mean = 2, sd = 1)
+X[,7] <- X[,8] + X[,6] + rnorm(m, mean = 2, sd = 1)
+X[,10] <- X[,8] + X[,9]+ rnorm(m, mean = 2, sd = 1)
+X[,11] <- X[,9] + X[,8] + rnorm(m, mean = 2, sd = 1)
+
+X <- cbind(X, rep(0,m))
+
+# add interventions - inhibit MEK
+m <- 600
+m_int <- 1801:2400
+X[m_int,2] <- rnorm(m, sd = 0.1)
+X[m_int,6] <- X[m_int,2] + X[m_int,8] + rnorm(m, mean = 2, sd = 1)
+X[m_int,7] <- X[m_int,8] + X[m_int,6] + rnorm(m, mean = 2, sd = 1)
+X[m_int,12] <- 2
+
+# add interventions - inhibit PIP2
+m <- 600
+m_int <- 2401:3000
+X[m_int,4] <- rnorm(m, sd = 0.1)
+X[m_int,12] <- 4
+
+# add interventions - inhibit Akt
+m <- 600
+m_int <- 3001:3600
+X[m_int,7] <- rnorm(m, sd = 0.1)
+X[m_int,12] <- 7
+
+# add interventions - activate PKA
+m <- 600
+m_int <- 3601:4200
+X[m_int,8] <- rnorm(m, mean = 6, sd = 1)
+X[m_int,1] <- X[m_int,8] + X[m_int,9] + rnorm(m, mean = 2, sd = 1)
+X[m_int,2] <- X[m_int,1] + X[m_int,8] + X[m_int,9] + rnorm(m, mean = 2, sd = 1)
+X[m_int,6] <- X[m_int,2] + X[m_int,8] + rnorm(m, mean = 2, sd = 1)
+X[m_int,7] <- X[m_int,8] + X[m_int,6] + rnorm(m, mean = 2, sd = 1)
+X[m_int,10] <- X[m_int,8] + X[m_int,9]+ rnorm(m, mean = 2, sd = 1)
+X[m_int,11] <- X[m_int,9] + X[m_int,8] + rnorm(m, mean = 2, sd = 1)
+X[m_int,12] <- 8
+
+# add interventions - inhibit PKC
+m <- 600
+m_int <- 4201:4800
+X[m_int,9] <-  rnorm(m, sd = .1)
+X[m_int,8] <- X[m_int,9] + rnorm(m, mean = 2, sd = 1)
+X[m_int,1] <- X[m_int,8] + X[m_int,9] + rnorm(m, mean = 2, sd = 1)
+X[m_int,2] <- X[m_int,1] + X[m_int,8] + X[m_int,9] + rnorm(m, mean = 2, sd = 1)
+X[m_int,6] <- X[m_int,2] + X[m_int,8] + rnorm(m, mean = 2, sd = 1)
+X[m_int,7] <- X[m_int,8] + X[m_int,6] + rnorm(m, mean = 2, sd = 1)
+X[m_int,10] <- X[m_int,8] + X[m_int,9]+ rnorm(m, mean = 2, sd = 1)
+X[m_int,11] <- X[m_int,9] + X[m_int,8] + rnorm(m, mean = 2, sd = 1)
+X[m_int,12] <- 9
+
+# add interventions - activate PKC
+m <- 600
+m_int <- 4801:5400
+X[m_int,9] <-  rnorm(m, mean = 6, sd = 1)
+X[m_int,8] <- X[m_int,9] + rnorm(m, mean = 2, sd = 1)
+X[m_int,1] <- X[m_int,8] + X[m_int,9] + rnorm(m, mean = 2, sd = 1)
+X[m_int,2] <- X[m_int,1] + X[m_int,8] + X[m_int,9] + rnorm(m, mean = 2, sd = 1)
+X[m_int,6] <- X[m_int,2] + X[m_int,8] + rnorm(m, mean = 2, sd = 1)
+X[m_int,7] <- X[m_int,8] + X[m_int,6] + rnorm(m, mean = 2, sd = 1)
+X[m_int,10] <- X[m_int,8] + X[m_int,9]+ rnorm(m, mean = 2, sd = 1)
+X[m_int,11] <- X[m_int,9] + X[m_int,8] + rnorm(m, mean = 2, sd = 1)
+X[m_int,12] <- 9
+
+s_sim <- as.data.frame(X)
+colnames(s_sim) <- c(c_names, "intervention")
+```
+
+
+### Results on simulated data
+
+The GIES algorithm performs really well with this kind of simulated data. The result of the PC algorithm is also good, considering that it only uses the 1800 observational data points. One has to keep in mind that some of the arcs are not directed and therefore count at the same time as correct and reversed arcs. The Tabu search, which performed best in the previous section, had more issues with the simulated data. 
+
+In this setting the BACKSHIFT algorithm is not able to predict a network. The diagonalization did not succeed. The reason for this is probably that the interventions are not shift interventions. The activators are simulated as shift interventions, but not the inhibitory perturbations.
+
+```{r, echo = FALSE,warning=FALSE, message=FALSE, fig.height = 5, fig.width = 8,out.width='4.8in',fig.align='center'}
+set.seed(123)
+cp <- numeric(4)
+rp <- numeric(4)
+op <- numeric(4)
+
+ds_sim <- bnlearn::discretize(s_sim[,1:11], method = 'hartemink', 
+                                        breaks = 3, ibreaks = 30)
+
+### pc alg
+m <- matrix(numeric(11^2),11)
+s_sim2 <- s_sim[s_sim$intervention == 0,]
+for (i in 1:100){
+  res <- pc.stable(s_sim2[sample(1:nrow(s_sim2), 1000),-12])
+  m <- m + amat(res) 
+}
+
+mm <- m > 100*0.85
+e = empty.graph(c_names)
+amat(e) <- mm
+
+# correct paths
+cp[1] <- sum(mm == true_m & true_m ==1)
+
+# reversed paths
+rp[1] <-sum(mm == true_rev_m & true_rev_m ==1)
+
+# paths not in model and not reversed
+op[1] <-sum(mm == 1 & (true_m+true_rev_m) ==0)
+
+
+### tabu
+
+set.seed(123)
+nodes = names(ds_sim)[1:11]
+start = random.graph(nodes = nodes, method = "melancon", num = 200, burn.in = 10^5, every = 100)
+perturbed = sapply(1:11, function(x) which(ds_sim$intervention == x))
+names(perturbed) = nodes
+netlist = lapply(start, function(net) {
+  tabu(ds_sim[, 1:11], score = "mbde", exp = perturbed, iss = 10, start = net, tabu = 50) })
+arcs = custom.strength(netlist, nodes = nodes)
+
+mm <- amat(averaged.network(arcs, threshold = 0.85))
+
+# correct paths
+cp[2] <- sum(mm == true_m & true_m ==1)
+
+# reversed paths
+rp[2] <-sum(mm == true_rev_m & true_rev_m ==1)
+
+# paths not in model and not reversed
+op[2] <-sum(mm == 1 & (true_m+true_rev_m) ==0)
+
+
+
+### gies
+t_ind <- c(rep(1,3*600),rep(c(2,3,4,5),600), rep(6,2*600))
+
+m <- matrix(numeric(11^2),11)
+
+for (i in 1:100){
+  s_ind <- sample(1:nrow(s_sim), 2000)
+  t_ind_s <- t_ind[s_ind]
+  score <- new("GaussL0penIntScore", s_sim[s_ind,-12], list(integer(0),2,4,7,8,9), t_ind_s)
+  gies.fit <- gies(score)
+  m <- m+as(gies.fit$essgraph, "matrix")
+}
+
+mm <- m > 100*0.8
+
+# correct paths
+cp[3] <- sum(mm == true_m & true_m ==1)
+
+# reversed paths
+rp[3] <-sum(mm == true_rev_m & true_rev_m ==1)
+
+# paths not in model and not reversed
+op[3] <-sum(mm == 1 & (true_m+true_rev_m) ==0)
+
+
+### backshift algorithm
+
+m <- matrix(numeric(11^2),11)
+a <- as.numeric(as.factor(s_sim$intervention))
+
+bs_model <- backShift(s_sim[,-12], a, 
+                      ev = 2, nsim = 100, threshold = 0.75, 
+                      verbose = FALSE)
+
+mm <- bs_model$AhatAdjacency>0.25
+
+# correct paths
+cp[4] <- sum(mm == true_m & true_m ==1)
+
+# reversed paths
+rp[4] <- sum(mm == true_rev_m & true_rev_m ==1)
+
+# paths not in model and not reversed
+op[4] <- sum(mm == 1 & (true_m+true_rev_m) ==0)
+```
+
+```{r, echo = FALSE,warning=FALSE, message=FALSE}
+library(kableExtra)
+df <- data.frame(correct = cp, reversed = rp, other = op)
+rownames(df) <- c("PC algorithm", "Tabu search", "GIES", "Backshift")
+df %>%
+  kable( ,caption = "Simulated Data - Results") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+
+# Methods
+
+Let $G = (V, A)$ be a network structure, a Directed Acyclic Graph (DAG), where $v_i \in V$ are the nodes and $a_{ij} \in A$ represent the arcs in the graph. Each node $v_i$ corresponds to a random variable $X_i$. Then a multivariate joint probability distribution $P(X)$ can be factorized into smaller local probability distribution according to the arcs of $G$. 
+
+$P(X_1, \cdots, X_n) = \prod_{i =1}^n P(X_i| Pa_i)$,
+where $Pa_i$ denotes the parents (in the graph $G$) of each random variable $X_i$.
+
+If a distribution factorizes in such a way then it is called a Bayesian network. This means that graph structure expresses the conditional independence relationships among the variables.
+
+## PC-algorithm of Peter Spirtes and Clark Glymour
+
+This algorithm belongs to the class of constraint-based structure learning. The idea is that if all the conditional independence relationships in the observational distribution are given, then part of the structure of the graph of $G$ can be inferred. 
+
+Unfortunately, it is not possible to identify the true graph $G$ from observational data. But Markov equivalence classes (MEC) of G can be identified. The definition of Markov equivalence class can be found in the book *Elements of Causal Inference* (5). Each MEC can be uniquely represented by a Completed Partially Directed Acyclic Graph (CPDAG).
+
+The PC-algorithm first determines the skeleton of the graph. Secondly, the v-structures are detected by checking for conditional dependence. Eventually, as many of the remaining edges are directed. 
+
+*Definition*: The nodes $x,y,z$ are a *v-structure* if 
+
+* The arcs are directed $x \rightarrow y \leftarrow z$.
+* There is no direct arc between $x$ and $z$.
+  
+This model does not take into account that some of the data was created in an interventional setting. To get a stable result, I applied the model 100 times on a random subset of 1000 observations and then only considered the arcs that appeared in more than 85% of the predicted graphs. 
+
+R package: *bnlearn*
+
+## Tabu search with modified BDe score
+
+I tried to use a similar model as the one they used in Sachs, et al, which included an adaptation of the Bayesian scoring metric (3) and simulated annealing. In the paper and in the supplement there are some details missing and it seemed to be challenging to use their approach. During research regarding Bayesian networks, I noticed that in the book *Bayesian Networks in R. with Applications in Systems Biology* there is a section, in which the authors also tried to reproduce the results from Sachs (2005). Therefore, I could just adapt their Bayesian network which uses a tabu search and modified BDe score. 
+
+The tabu search is a score based method. This method tests different graph structures and tries to find the structure that best fits the data. The idea is that to each graph $G$ that represents the causal structure a score is assigned. The score measures how well $G$ fits the data. The algorithm starts with the empty graph and searches over the space of DAGs to find the graph with the highest score. Typically the BIC is used for the score. Here, they chose an adaptation of the Bayesian scoring metric (3), the modified BDe score, as the score function. 
+
+The predicted network in the book is closer to the one from Sachs (2015). 12 of the their predicted arcs correspond to the one of the validated network, 2 arcs point in the wrong direction and 7 of the predicted arcs are not in the validated network. 
+
+They seem to pre-process the data in a different way. Each of their data set contains exactly 600 observations. I did not work with their data because they only provided a version with discrete values. The BACKSHIFT algorithm does not work on data with just 3 levels. 
+
+R package: *bnlearn*
+
+## Greedy interventional equivalence search (GIES) algorithm
+
+The Greedy interventional equivalence search (GIES) algorithm is also a score based method and is a generalization of the Greedy Equivalence Search (GES) algorithm of Chickering (2002). The GIES has the advantage that it can be used for interventional data. 
+
+The number of DAGs with p nodes grows super-exponentially and therefore it is not possible to compute the score for all the DAGs. Therefore, a greedy search technique with 3 phases is used.
+
+1. Forward phase. Edges are added until a local maximum is reached.
+2. Backward phase. Remove edges until a local maximum is reached.
+3. Turning phase. Single arrows are reversed in the space of DAGs until the score cannot be increased. 
+
+To compare this model with the other approaches, I also applied it 100 times on a random subset of 2000 observations and then only considered the arcs that appeared in more than 85% of the predicted graphs. Because this method uses the full dataset, 2000 instead of 1000 data points were chosen. 
+
+R package: *pcalg* 
+
+## BACKSHIFT algorithm
+
+The BACKSHIFT method uses different experimental conditions (or environments) with unknown targets to uncover the causal structure of the measured variables. The model assumes a linear causal model. This model can also include cycles and confounders. In this model the experimental conditions are modeled as so-called "shift interventions". 
+
+Assume that we have linear causal structure $X \rightarrow Y \rightarrow Z$.
+
+$$ X = \epsilon_x, \qquad Y = b_{xy}X + \epsilon_y, \qquad Z= b_{yz}Y+ \epsilon_z.$$
+
+This is the data-generation process under no intervention (environment 0). Here, $b_{xy}$ expresses the strength of the linear causal effect from X to Y and $\epsilon_x$ is the noise of the random variable $X$. A different experimental condition (environment $j$, with $j \neq 0$ ) are assumed to be of the form
+
+$$ X = \epsilon_x + c_x^j, \qquad Y = b_{xy}X + \epsilon_y+ c_y^j, \qquad Z= b_{yz}Y+ \epsilon_z+c_z^j.$$
+
+The variable $c_x^j$ describes how much the variable $X$ is shifted in environment j and is assumed to be a realization of a random variable. It is possible that some of the $c_i^j$'s are zero.
+
+A general linear causal structure can be written as 
+
+$$ X = BX + \epsilon,$$ 
+
+where $x \in \mathbb{R}^p$ is a random vector and $B \in \mathbb{R}^{p \times p}$. In that case, the data in environment $j$ are observations of the model
+
+$$ X^{(j)} = BX^{(j)} + c^{(j)}+ \epsilon^{(j)},$$
+which can also be written as
+$$ (I-B)X^{(j)} = c^{(j)}+ \epsilon^{(j)}.$$
+
+The non-zero coefficients of the connectivity matrix $B$ correspond to the direct causal relationships. The matrix is not affected by the interventions. A simple joint matrix diagonalization is used to estimate the matrix $B$ and the estimation is based on the covariance of $X$ in environment $j$, the covariance of $c$ in environment $j$ and the covariance of the noise. 
+
+Probably, this method does not perform so well on the simulated data, because the interventional data was not created using shift interventions. Instead, the noise of the observations of the inhibitory interventions has a smaller variance than in the observational setting. Additionally, we exactly know which variables are the target of the intervention. The BACKSHIFT method makes no use of this information. 
+
+R package: *backShift*
+
+\pagebreak
+
+# Conclusions and Discussion
+
+It is impressive that they were able to almost reconstruct the conventionally accepted signaling molecule interactions and even predicted some new connections. But the results of this project show that one needs to know the methods, its advantages and disadvantages, in detail to apply them properly. 
+
+The pre-processing of the data has a noticeable impact on the resulting network. It matters which outliers are removed and which technique is used to discretize the data. Even small changes in the process can lead to different results. If the "true" network is known, or at least some parts of it, then it looks as if it is possible to apply the causal inference methods successfully. But without any additional knowledge concerning the causal structure it is difficult to detect the true causal structure.  
+
+The BACKSHIFT algorithm was not suitable for this data. The other algorithms had in general better results. In this data, there were no cycles and also no hidden variables in the network structure. We also knew exactly which are the site of the interventions. If this were not the case then it would be reasonable to use the BACKSHIFT algorithm. If there are hidden variables present then one could also use the FCI (Fast Causal Inference) algorithm. 
+
+Those methods cannot be applied per default on every dataset. The structure of the data is important and each situation needs a suitable approach. 
+
+# References
+
+1. K. Sachs, O. Perez, D. Pe'er, D. Lauffenburger, G. Nolan, _Causal Protein-Signaling Networks Derived from Multiparameter Single-Cell Data_, Science __308__ (2005).
+2. S. Triantafillou, V. Lagani, C. Heinze-Deml, A. Schmidt, J. Tegner, I. Tsamardinos, _Predicting Causal Relationships from Biological Data: Applying Automated Causal Discovery on Mass Cytometry Data of Human Immune Cells_, Nature __308__ (2005).
+3. D. Pe'er, A. Regev, G. Elidan, N. Friedman, _Bioinformatics_ 17 (suppl. 1), 2001.
+4. R. Nagarajan, M. Scutari, S. Lbre, Bayesian Networks in R. with Applications in Systems Biology, 2013.
+5. J. Peters, D. Janzing, B. Schölkopf, Elements of Causal Inference, 2018.
